@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # SPDX-ArtifactOfProjectHomePage: https://github.com/Second-Hand-Friends/kleinanzeigen-bot/
 import atexit, enum, json, os, re, signal, sys, textwrap  # isort: skip
+import asyncio
 import getopt  # pylint: disable=deprecated-module
 import urllib.parse as urllib_parse
 from gettext import gettext as _
@@ -605,22 +606,25 @@ class KleinanzeigenBot(WebScrapingMixin):
         await self.fill_login_data_and_send()
         await self.handle_after_login_logic()
 
-        # Sometimes a second login is required
-        if not await self.is_logged_in():
-            await self.fill_login_data_and_send()
-            await self.handle_after_login_logic()
+        # Note: second login attempt removed for Auth0 SSO (2-step flow doesn't support re-entry)
 
     async def fill_login_data_and_send(self) -> None:
         LOG.info("Logging in as [%s]...", self.config.login.username)
-        await self.web_input(By.ID, "login-email", self.config.login.username)
 
-        # clearing password input in case browser has stored login data set
-        await self.web_input(By.ID, "login-password", "")
-        await self.web_input(By.ID, "login-password", self.config.login.password)
-
+        # New Auth0 SSO login (2-step: email -> password)
+        # Step 1: Enter email on login.kleinanzeigen.de/u/login/identifier
+        await self.web_input(By.ID, "username", self.config.login.username)
         await self.check_and_wait_for_captcha(is_login_page = True)
+        await self.web_click(By.CSS_SELECTOR, "button[name='action'][type='submit']")
 
-        await self.web_click(By.CSS_SELECTOR, "form#login-form button[type='submit']")
+        # Wait for password page to load
+        await asyncio.sleep(5)
+
+        # Step 2: Enter password on login.kleinanzeigen.de/u/login/password
+        await self.web_input(By.ID, "password", "")
+        await self.web_input(By.ID, "password", self.config.login.password)
+        await self.check_and_wait_for_captcha(is_login_page = True)
+        await self.web_click(By.CSS_SELECTOR, "button[name='action'][type='submit']")
 
     async def handle_after_login_logic(self) -> None:
         try:

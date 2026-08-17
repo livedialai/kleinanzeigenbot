@@ -199,6 +199,7 @@ class WebScrapingMixin:
             browser_args = browser_args,
             user_data_dir = self.browser_config.user_data_dir
         )
+        cfg.sandbox = False  # disable sandbox for root/headless
 
         # already logged by nodriver:
         # LOG.debug("-> Effective browser arguments: \n\t\t%s", "\n\t\t".join(cfg.browser_args))
