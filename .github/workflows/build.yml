@@ -1,0 +1,525 @@
+# SPDX-FileCopyrightText: © Sebastian Thomschke and contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-ArtifactOfProjectHomePage: https://github.com/Second-Hand-Friends/kleinanzeigen-bot
+#
+# https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions
+name: Build
+
+on:
+  schedule:
+    - cron: '0 15 1 * *'
+  push:
+    branches-ignore:  # build all branches except:
+    - 'dependabot/**'     # prevent GHA triggered twice (once for commit to the branch and once for opening/syncing the PR)
+    - 'dependencies/pdm'  # prevent GHA triggered twice (once for commit to the branch and once for opening/syncing the PR)
+    tags-ignore:  # don't build tags
+    - '**'
+    paths-ignore:
+    - '**/*.md'
+    - '.act*'
+    - '.editorconfig'
+    - '.git*'
+    - '.github/*.yml'
+    - '.github/ISSUE_TEMPLATE/*'
+    - '.github/workflows/codeql-analysis.yml'
+    - '.github/workflows/stale.yml'
+    - '.github/workflows/update-python-deps.yml'
+    - '.github/workflows/validate-pr.yml'
+    - 'codecov.yml'
+  pull_request:
+    paths-ignore:
+    - '**/*.md'
+    - '.act*'
+    - '.editorconfig'
+    - '.git*'
+    - '.github/*.yml'
+    - '.github/ISSUE_TEMPLATE/*'
+    - '.github/workflows/codeql-analysis.yml'
+    - '.github/workflows/stale.yml'
+    - '.github/workflows/update-python-deps.yml'
+    - '.github/workflows/validate-pr.yml'
+    - 'codecov.yml'
+  workflow_dispatch:
+    # https://github.blog/changelog/2020-07-06-github-actions-manual-triggers-with-workflow_dispatch/
+
+
+defaults:
+  run:
+    shell: bash
+
+
+jobs:
+
+  ###########################################################
+  build:
+  ###########################################################
+
+    permissions:
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: macos-13    # X86
+          PYTHON_VERSION: "3.10"
+          PUBLISH_RELEASE: false
+        - os: macos-latest # ARM
+          PYTHON_VERSION: "3.10"
+          PUBLISH_RELEASE: false
+        - os: ubuntu-latest
+          PYTHON_VERSION: "3.10"
+          PUBLISH_RELEASE: false
+        - os: windows-latest
+          PYTHON_VERSION: "3.10"
+          PUBLISH_RELEASE: false
+        - os: macos-13    # X86
+          PYTHON_VERSION: "3.13.5"
+          PUBLISH_RELEASE: true
+        - os: macos-latest # ARM
+          PYTHON_VERSION: "3.13.5"
+          PUBLISH_RELEASE: true
+        - os: ubuntu-latest
+          PYTHON_VERSION: "3.13.5"
+          PUBLISH_RELEASE: true
+        - os: windows-latest
+          PYTHON_VERSION: "3.13.5"
+          PUBLISH_RELEASE: true
+
+    runs-on: ${{ matrix.os }} # https://github.com/actions/runner-images#available-images
+    timeout-minutes: 10
+
+    steps:
+    - name: "Show: GitHub context"
+      env:
+        GITHUB_CONTEXT: ${{ toJSON(github) }}
+      run: echo $GITHUB_CONTEXT
+
+
+    - name: "Show: environment variables"
+      run: env | sort
+
+
+    - name: Configure Fast APT Mirror
+      uses: vegardit/fast-apt-mirror.sh@v1
+
+
+    - name: Git Checkout
+      uses: actions/checkout@v5  # https://github.com/actions/checkout
+
+
+    - name: "Install: Chromium Browser"
+      if: env.ACT == 'true' && startsWith(matrix.os, 'ubuntu')
+      run: |
+        if ! hash google-chrome &>/dev/null; then
+          curl -sSfL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb
+          sudo dpkg -i /tmp/chrome.deb || true
+          sudo apt-get --no-install-recommends -y --fix-broken install
+        fi
+
+
+    - name: "Install: Python and PDM"  # https://github.com/pdm-project/setup-pdm
+      uses: pdm-project/setup-pdm@v4
+      with:
+        python-version: "${{ matrix.PYTHON_VERSION }}"
+        cache: ${{ !startsWith(matrix.os, 'macos') }}  # https://github.com/pdm-project/setup-pdm/issues/55
+
+
+    - name: "Install: Python dependencies"
+      run: |
+        set -eux
+
+        python --version
+        python -m pip install --upgrade pip
+        pip install --upgrade pdm
+        if [[ ! -e .venv ]]; then
+          pdm venv create || true
+        fi
+        pdm sync --clean -v
+
+
+    - name: Display project metadata
+      run: pdm show
+
+
+    - name: Check with pip-audit
+      # until https://github.com/astral-sh/ruff/issues/8277
+      run:
+        pdm run pip-audit --progress-spinner off --skip-editable --verbose
+
+
+    - name: Check with ruff
+      run: pdm run ruff check
+
+
+    - name: Check with mypy
+      run: pdm run mypy
+
+
+    - name: Check with basedpyright
+      run: pdm run basedpyright
+
+
+    - name: Run unit tests
+      run: pdm run utest:cov -vv
+
+
+    - name: Run integration tests
+      run: |
+        set -eux
+
+        case "${{ matrix.os }}" in
+           ubuntu-*)
+              sudo apt-get install --no-install-recommends -y xvfb
+              xvfb-run pdm run itest:cov -vv
+              ;;
+           *) pdm run itest:cov -vv
+              ;;
+        esac
+
+
+    - name: Run smoke tests
+      run: pdm run smoke:cov -vv
+
+
+    - name: Run app from source
+      run: |
+        echo "
+        login:
+          username: 'john.doe@example.com'
+          password: 'such_a_secret'
+        " > config.yaml
+
+        set -eux
+
+        pdm run app help
+        pdm run app version
+        pdm run app verify
+
+
+    - name: "Install: binutils (strip)"
+      if: startsWith(matrix.os, 'ubuntu')
+      run: sudo apt-get install --no-install-recommends -y binutils
+
+
+    - name: "Install: UPX"
+      if: startsWith(matrix.os, 'windows')
+      run: |
+        set -eu
+
+        upx_download_url=$(curl -fsSL -H "Authorization: token ${{ github.token }}" https://api.github.com/repos/upx/upx/releases/latest | grep browser_download_url | grep win64.zip | cut "-d\"" -f4)
+        echo "Downloading [$upx_download_url]..."
+        curl -fL -o /tmp/upx.zip $upx_download_url
+
+        echo "Extracting upx zip..."
+        mkdir /tmp/upx
+        7z e /tmp/upx.zip -o/tmp/upx *.exe -r
+        echo "$(cygpath -wa /tmp/upx)" >> $GITHUB_PATH
+
+        /tmp/upx/upx.exe --version
+
+
+    - name: Build self-contained executable
+      run: |
+        set -eux
+
+        if [[ "${{ runner.os }}" == "Windows" ]]; then
+          NO_UPX=1 pdm run compile
+          mv dist/kleinanzeigen-bot.exe dist/kleinanzeigen-bot-uncompressed.exe
+        fi
+
+        pdm run compile
+
+        ls -l dist
+
+
+    - name: Run self-contained executable
+      run: |
+        set -eux
+
+        dist/kleinanzeigen-bot help
+        dist/kleinanzeigen-bot version
+        dist/kleinanzeigen-bot verify
+
+
+    - name: Upload self-contained executable
+      uses: actions/upload-artifact@v4
+      if: (github.ref_name == 'main' || github.ref_name == 'release') && matrix.PUBLISH_RELEASE && !env.ACT
+      with:
+        name: artifacts-${{ matrix.os }}
+        path: dist/kleinanzeigen-bot*
+
+
+    - name: Build Docker image
+      if: startsWith(matrix.os, 'ubuntu')
+      run: |
+        set -eux
+
+        bash docker/build-image.sh
+
+        docker run --rm second-hand-friends/kleinanzeigen-bot help
+
+
+    - name: Publish Docker image
+      if: github.repository_owner == 'Second-Hand-Friends' && github.ref_name == 'main' && matrix.PUBLISH_RELEASE && startsWith(matrix.os, 'ubuntu') && !env.ACT
+      run: |
+        set -eux
+
+        echo "${{ github.token }}" | docker login https://ghcr.io -u ${{ github.actor }} --password-stdin
+
+        image_name="second-hand-friends/kleinanzeigen-bot"
+        docker image tag $image_name ghcr.io/$image_name
+        docker push ghcr.io/$image_name
+
+
+    - name: Collect coverage reports
+      uses: actions/upload-artifact@v4
+      if: (github.ref_name == 'main' || github.event_name == 'pull_request') && !env.ACT
+      with:
+        name: coverage-${{ matrix.os }}-py${{ matrix.PYTHON_VERSION }}
+        include-hidden-files: true
+        path: .temp/coverage-*.xml
+        if-no-files-found: error
+
+
+  ###########################################################
+  publish-coverage:
+  ###########################################################
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: (github.ref_name == 'main' || github.event_name == 'pull_request') && !github.event.act
+
+    steps:
+    - name: Git Checkout # required to avoid https://docs.codecov.com/docs/error-reference#unusable-reports
+      uses: actions/checkout@v5  # https://github.com/actions/checkout
+
+
+    - name: Download coverage reports
+      uses: actions/download-artifact@v5
+      with:
+        pattern: coverage-*
+        path: coverage
+
+
+    - name: List coverage reports
+      run: find . -name coverage-*.xml
+
+
+    - name: Publish unit-test coverage
+      uses: codecov/codecov-action@v5  # https://github.com/codecov/codecov-action
+      with:
+        slug: ${{ github.repository }}
+        name: unit-coverage
+        flags: unit-tests
+        disable_search: true
+        files: coverage/**/coverage-unit.xml
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+
+    - name: Publish integration-test coverage
+      uses: codecov/codecov-action@v5  # https://github.com/codecov/codecov-action
+      with:
+        slug: ${{ github.repository }}
+        name: integration-coverage
+        flags: integration-tests
+        disable_search: true
+        files: coverage/**/coverage-integration.xml
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+
+    - name: Publish smoke-test coverage
+      uses: codecov/codecov-action@v5  # https://github.com/codecov/codecov-action
+      with:
+        slug: ${{ github.repository }}
+        name: smoke-coverage
+        flags: smoke-tests
+        disable_search: true
+        files: coverage/**/coverage-smoke.xml
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+
+  ###########################################################
+  publish-release:
+  ###########################################################
+    needs: [build, publish-coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: write
+
+    # run on 'main' and 'release' branch when:
+    #   – build succeeded, AND
+    #   – publish-coverage succeeded OR was skipped
+    if: >
+        always()
+          && needs.build.result == 'success'
+          && (needs.publish-coverage.result == 'success' || needs.publish-coverage.result == 'skipped')
+        && (github.ref_name == 'main' || github.ref_name == 'release') && !github.event.act
+
+    concurrency: publish-${{ github.ref_name }}-release # https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idconcurrency
+
+    steps:
+    - name: "Show: GitHub context"
+      env:
+        GITHUB_CONTEXT: ${{ toJSON(github) }}
+      run: echo $GITHUB_CONTEXT
+
+
+    - name: "Show: environment variables"
+      run: env | sort
+
+
+    - name: Configure Fast APT Mirror
+      uses: vegardit/fast-apt-mirror.sh@v1
+
+
+    - name: Git Checkout
+      # only required by "gh release create" to prevent "fatal: Not a git repository"
+      uses: actions/checkout@v5  # https://github.com/actions/checkout
+
+
+    - name: Delete untagged docker image
+      continue-on-error: true
+      uses: actions/delete-package-versions@v5
+      with:
+        token: ${{ github.token }}
+        delete-only-untagged-versions: true
+        package-name: kleinanzeigen-bot
+        package-type: container
+
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v5
+
+
+    - name: Rename build artifacts
+      run: |
+        mv artifacts-macos-13/kleinanzeigen-bot kleinanzeigen-bot-darwin-amd64
+        mv artifacts-macos-latest/kleinanzeigen-bot kleinanzeigen-bot-darwin-arm64
+        mv artifacts-ubuntu-latest/kleinanzeigen-bot kleinanzeigen-bot-linux-amd64
+        mv artifacts-windows-latest/kleinanzeigen-bot-uncompressed.exe kleinanzeigen-bot-windows-amd64-uncompressed.exe
+        mv artifacts-windows-latest/kleinanzeigen-bot.exe kleinanzeigen-bot-windows-amd64.exe
+
+
+    - name: Install ClamAV
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clamav
+        sudo systemctl stop clamav-freshclam.service
+        sudo freshclam
+
+
+    - name: Scan build artifacts
+      run: clamscan kleinanzeigen-*
+
+
+    - name: "Determine release name"
+      id: release
+      if: github.event_name != 'schedule'
+      run: |
+        case "$GITHUB_REF_NAME" in
+          main)
+            echo "name=preview" >>"$GITHUB_OUTPUT"
+            ;;
+          release)
+            echo "name=latest" >>"$GITHUB_OUTPUT"
+            ;;
+        esac
+
+
+    - name: "Delete previous '${{ steps.release.outputs.name }}' release"
+      if: steps.release.outputs.name && steps.release.outputs.name != ''
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_NAME: ${{ steps.release.outputs.name }}
+      # https://cli.github.com/manual/gh_release_delete
+      run: |
+        GH_DEBUG=1 gh release delete "$RELEASE_NAME" --yes --cleanup-tag || true
+
+
+    - name: "Create '${{ steps.release.outputs.name }}' Release"
+      if: steps.release.outputs.name && steps.release.outputs.name != ''
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_NAME: ${{ steps.release.outputs.name }}
+        COMMIT_MSG: |  # https://stackoverflow.com/a/78420438/5116073
+          ${{ github.event.head_commit.message }}
+
+          ---
+          #### ⚠️ Rechtlicher Hinweis
+          <p>Die Verwendung dieses Programms kann unter Umständen gegen die zum jeweiligen Zeitpunkt bei kleinanzeigen.de geltenden Nutzungsbedingungen verstoßen.
+          Es liegt in Ihrer Verantwortung, die rechtliche Zulässigkeit der Nutzung dieses Programms zu prüfen.
+          Die Entwickler übernehmen keinerlei Haftung für mögliche Schäden oder rechtliche Konsequenzen.
+          Die Nutzung erfolgt auf eigenes Risiko. Jede rechtswidrige Verwendung ist untersagt.</p>
+
+          #### ⚠️ Legal notice
+          <p>The use of this program could violate the terms of service of kleinanzeigen.de valid at the time of use.
+          It is your responsibility to ensure the legal compliance of its use.
+          The developers assume no liability for any damages or legal consequences.
+          Use is at your own risk. Any unlawful use is strictly prohibited.</p>
+
+      # https://cli.github.com/manual/gh_release_create
+      run: |
+        GH_DEBUG=1 gh release create "$RELEASE_NAME" \
+          --title "$RELEASE_NAME" \
+          ${{ steps.release.outputs.name == 'latest' && '--latest' || '' }} \
+          ${{ steps.release.outputs.name == 'preview' && '--prerelease' || '' }} \
+          --notes "$COMMIT_MSG" \
+          --target "${{ github.sha }}" \
+          kleinanzeigen-bot-darwin-amd64 \
+          kleinanzeigen-bot-darwin-arm64 \
+          kleinanzeigen-bot-linux-amd64 \
+          kleinanzeigen-bot-windows-amd64.exe \
+          kleinanzeigen-bot-windows-amd64-uncompressed.exe
+
+
+    - name: "Delete intermediate build artifacts"
+      uses: geekyeggo/delete-artifact@v5  # https://github.com/GeekyEggo/delete-artifact/
+      with:
+        name: "*"
+        failOnError: false
+
+
+  ###########################################################
+  dependabot-pr-auto-merge:
+  ###########################################################
+    needs: build
+    if: github.event_name == 'pull_request' && github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+    - name: Merge Dependabot PR
+      env:
+        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        PR_URL: ${{github.event.pull_request.html_url}}
+      run: gh pr merge --auto --rebase "$PR_URL"
+
+
+  ###########################################################
+  pdm-pr-auto-merge:
+  ###########################################################
+    needs: build
+    if: github.event_name == 'pull_request' && github.actor == 'kleinanzeigen-bot-tu[bot]' && github.head_ref == 'dependencies/pdm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+    - name: Merge Dependabot PR
+      env:
+        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        PR_URL: ${{github.event.pull_request.html_url}}
+      run: gh pr merge --auto --rebase "$PR_URL"
